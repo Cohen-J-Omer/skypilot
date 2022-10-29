@@ -112,6 +112,7 @@ extras_require = {
     # azure-identity is needed in node_provider.
     'azure': ['azure-cli>=2.31.0', 'azure-core', 'azure-identity'],
     'gcp': ['google-api-python-client', 'google-cloud-storage'],
+    'ibm':['ibm_cloud_sdk_core','ibm_vpc'],
     'docker': ['docker'],
 }
 
