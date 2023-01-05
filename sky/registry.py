@@ -13,7 +13,7 @@ _CLOUDS = [
     clouds.AWS(),
     clouds.Azure(),
     clouds.GCP(),
-    clouds.IBM
+    clouds.IBM()
 ]
 
 
