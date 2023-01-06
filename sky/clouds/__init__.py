@@ -10,7 +10,7 @@ from sky.clouds.local import Local
 from sky.clouds.ibm import IBM
 
 __all__ = [
-    "IBM",
+    'IBM',
     'AWS',
     'Azure',
     'Cloud',
