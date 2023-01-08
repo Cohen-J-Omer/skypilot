@@ -9,12 +9,7 @@ from sky import clouds
 if typing.TYPE_CHECKING:
     from sky import resources as resources_lib
 
-_CLOUDS = [
-    clouds.AWS(),
-    clouds.Azure(),
-    clouds.GCP(),
-    clouds.IBM()
-]
+_CLOUDS = [clouds.AWS(), clouds.Azure(), clouds.GCP(), clouds.IBM()]
 
 
 def _filter_out_blocked_clouds(task: sky.Task):
