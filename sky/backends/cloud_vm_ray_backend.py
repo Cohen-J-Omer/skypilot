@@ -866,6 +866,7 @@ class RetryingVmProvisioner(object):
             clouds.AWS: self._update_blocklist_on_aws_error,
             clouds.Azure: self._update_blocklist_on_azure_error,
             clouds.GCP: self._update_blocklist_on_gcp_error,
+            clouds.IBM: self._update_blocklist_on_ibm_error,
             clouds.Local: self._update_blocklist_on_local_error,
         }
         cloud_type = type(cloud)
@@ -2900,8 +2901,7 @@ class CloudVmRayBackend(backends.Backend):
                 return False
             # pylint: disable=line-too-long E1136
             vpcs_filtered_by_tags_and_region = search_client.search(
-                query=
-                f'type:vpc AND tags:{cluster_name} AND region:{region}',
+                query=f'type:vpc AND tags:{cluster_name} AND region:{region}',
                 fields=['tags', 'region', 'type'],
                 limit=1000).get_result()['items']
             try:
@@ -2921,8 +2921,7 @@ class CloudVmRayBackend(backends.Backend):
                     vpc_client.delete_instance(id=id).get_result()
                     _poll_instance_exists(id)
             vpc_provider = IBMVPCProvider(config_provider['resource_group_id'],
-                                          region,
-                                          cluster_name)
+                                          region, cluster_name)
             vpc_provider.delete_vpc(vpc_id, region)
             # successfully removed cluster
             returncode = 0
