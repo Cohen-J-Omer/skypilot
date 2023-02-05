@@ -8,7 +8,7 @@ import urllib.parse
 
 from sky import exceptions
 from sky import sky_logging
-from sky.adaptors import aws, gcp
+from sky.adaptors import aws, gcp, ibm
 from sky.utils import ux_utils
 
 Client = Any
@@ -39,6 +39,16 @@ def split_gcs_path(gcs_path: str) -> Tuple[str, str]:
     key = '/'.join(path_parts)
     return bucket, key
 
+def split_cos_path(s3_path: str, region: str):
+    """Splits cos Path into Bucket name and Relative Path to Bucket
+
+    Args:
+      cos_path: str; cos Path, e.g. cos://eu-de/bucket-name/logs/13.6.22
+    """
+    path_parts = s3_path.replace(f'cos://{region}/', '').split('/')
+    bucket = path_parts.pop(0)
+    key = '/'.join(path_parts)
+    return bucket, key
 
 def create_s3_client(region: str = 'us-east-2') -> Client:
     """Helper method that connects to Boto3 client for S3 Bucket
@@ -161,6 +171,52 @@ def parallel_upload(source_path_list: List[str],
             zip(commands, [access_denied_message] * len(commands),
                 [bucket_name] * len(commands)))
 
+def parallel_upload_rclone(source_path_list: List[str],
+                    sync_command_generator: Callable[[str, List[str]], str],
+                    bucket_name: str,
+                    access_denied_message: str,
+                    create_dirs: bool = False,
+                    max_concurrent_uploads: Optional[int] = None) -> None:
+    """Helper function to run parallel uploads for a list of paths.
+
+    Used by S3Store and GCSStore to run rsync commands in parallel by
+    providing appropriate command generators.
+
+    Args:
+        source_path_list: List of paths to local files or directories
+        filesync_command_generator: Callable that generates rsync command
+            for a list of files belonging to the same dir.
+        dirsync_command_generator: Callable that generates rsync command
+            for a directory.
+        access_denied_message: Message to intercept from the underlying
+            upload utility when permissions are insufficient. Used in
+            exception handling.
+        create_dirs: If the local_path is a directory and this is set to
+            False, the contents of the directory are directly uploaded to
+            root of the bucket. If the local_path is a directory and this is
+            set to True, the directory is created in the bucket root and
+            contents are uploaded to it.
+        max_concurrent_uploads: Maximum number of concurrent threads to use
+            to upload files.
+    """
+    # Generate rclone rsync command for files and dirs
+    commands = []
+
+    for path in source_path_list:
+        if os.path.isdir(path) and create_dirs:
+            dest_dir_name = os.path.basename(path)
+        else:
+            dest_dir_name = ''
+        sync_command = sync_command_generator(path, dest_dir_name)
+        commands.append(sync_command)
+
+    # Run commands in parallel
+    with pool.ThreadPool(processes=max_concurrent_uploads) as p:
+        p.starmap(
+            run_upload_cli,
+            zip(commands, [access_denied_message] * len(commands),
+                [bucket_name] * len(commands)))
+
 
 def run_upload_cli(command: str, access_denied_message: str, bucket_name: str):
     # TODO(zhwu): Use log_lib.run_with_log() and redirect the output
@@ -193,3 +249,51 @@ def run_upload_cli(command: str, access_denied_message: str, bucket_name: str):
                 raise exceptions.StorageUploadError(
                     f'Upload to bucket failed for store {bucket_name}. '
                     'Please check the logs.')
+
+
+def store_rclone_config(region: str):
+    """creates a configuration files for rclone - used for 
+    bucket syncing and mounting """
+
+    import textwrap
+    path = os.path.expanduser("~/.config/rclone/rclone.conf")
+    access_key_id, secret_access_key  = get_hmac_keys()
+
+    config_data = textwrap.dedent(f"""\
+        [remote]
+        type = s3
+        provider = IBMCOS
+        access_key_id = {access_key_id}
+        secret_access_key = {secret_access_key}
+        region = {region}
+        endpoint = s3.{region}.cloud-object-storage.appdomain.cloud
+        location_constraint = {region}-smart
+        acl = private
+        """)
+    if not os.path.isdir(os.path.dirname(path)):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    # w will create rclone.conf, while r won't to avoid overriding data.
+    # + mode will allow r to append data and w to read it. 
+    mode = 'r+' if os.path.isfile(path) else 'w+'
+    with open(path, mode) as f:
+        file_contents = textwrap.dedent(f.read())
+        if config_data not in file_contents:
+            # will append data instead of overwrite since f.read()
+            # will move file pointer to the end
+            f.write('\n'+config_data)
+    return config_data
+
+def get_cos_client(region: str = 'us-east'):
+    return ibm.get_cos_client(region)
+
+def get_cos_resource(region: str = 'us-east'):
+    return ibm.get_cos_resource(region)
+
+def get_cos_instance():
+    return ibm.get_storage_instance_id()
+
+def get_api_key():
+    return ibm.get_api_key()
+
+def get_hmac_keys():
+    return ibm.get_hmac_keys()

@@ -36,7 +36,7 @@ SourceType: TypeAlias = Union[Path, List[Path]]
 
 # Clouds with object storage implemented in this module. Azure Blob
 # Storage isn't supported yet (even though Azure is).
-STORE_ENABLED_CLOUDS = [clouds.AWS(), clouds.GCP()]
+STORE_ENABLED_CLOUDS = [clouds.AWS(), clouds.GCP(), clouds.IBM()]
 
 # Max number of objects a GCS bucket can be directly deleted with
 _GCS_RM_MAX_OBJS = 256
@@ -55,6 +55,7 @@ class StoreType(enum.Enum):
     S3 = 'S3'
     GCS = 'GCS'
     AZURE = 'AZURE'
+    IBM = 'COS'
 
     @classmethod
     def from_cloud(cls, cloud: clouds.Cloud) -> 'StoreType':
@@ -64,6 +65,8 @@ class StoreType(enum.Enum):
             return StoreType.GCS
         elif isinstance(cloud, clouds.Azure):
             return StoreType.AZURE
+        elif isinstance(cloud, clouds.IBM):
+            return StoreType.IBM
 
         raise ValueError(f'Unsupported cloud for StoreType: {cloud}')
 
@@ -73,6 +76,8 @@ class StoreType(enum.Enum):
             return StoreType.S3
         elif isinstance(store, GcsStore):
             return StoreType.GCS
+        elif isinstance(store, CosStore):
+            return StoreType.IBM
         else:
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(f'Unknown store type: {store}')
@@ -88,6 +93,8 @@ def get_storetype_from_cloud(cloud: clouds.Cloud) -> StoreType:
         return StoreType.S3
     elif isinstance(cloud, clouds.GCP):
         return StoreType.GCS
+    elif isinstance(cloud, clouds.IBM):
+        return StoreType.IBM
     elif isinstance(cloud, clouds.Azure):
         with ux_utils.print_exception_no_traceback():
             raise ValueError('Azure Blob Storage is not supported yet.')
@@ -101,6 +108,8 @@ def get_store_prefix(storetype: StoreType) -> str:
         return 's3://'
     elif storetype == StoreType.GCS:
         return 'gs://'
+    elif storetype == StoreType.IBM:
+        return 'cos://'
     elif storetype == StoreType.AZURE:
         with ux_utils.print_exception_no_traceback():
             raise ValueError('Azure Blob Storage is not supported yet.')
@@ -409,6 +418,9 @@ class Storage(object):
                 elif s_type == StoreType.GCS:
                     store = GcsStore.from_metadata(s_metadata,
                                                    source=self.source)
+                elif s_type == StoreType.IBM:
+                    store = CosStore.from_metadata(s_metadata,
+                                                   source=self.source)                                                                   
                 else:
                     with ux_utils.print_exception_no_traceback():
                         raise ValueError(f'Unknown store type: {s_type}')
@@ -445,6 +457,8 @@ class Storage(object):
                         self.add_store(StoreType.S3)
                     elif self.source.startswith('gs://'):
                         self.add_store(StoreType.GCS)
+                    elif self.source.startswith('cos://'):
+                        self.add_store(StoreType.IBM)
 
     @staticmethod
     def _validate_source(
@@ -525,7 +539,7 @@ class Storage(object):
                             'using a bucket by writing <destination_path>: '
                             f'{source} in the file_mounts section of your YAML')
                 is_local_source = True
-            elif split_path.scheme in ['s3', 'gs']:
+            elif split_path.scheme in ['s3', 'gs', 'cos']:
                 is_local_source = False
                 # Storage mounting does not support mounting specific files from
                 # cloud store - ensure path points to only a directory
@@ -541,7 +555,7 @@ class Storage(object):
             else:
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageSourceError(
-                        f'Supported paths: local, s3://, gs://. Got: {source}')
+                        f'Supported paths: local, s3://, gs://, cos://. Got: {source}')
         return source, is_local_source
 
     def _validate_storage_spec(self) -> None:
@@ -625,6 +639,8 @@ class Storage(object):
             store_cls = S3Store
         elif store_type == StoreType.GCS:
             store_cls = GcsStore
+        elif store_type == StoreType.IBM:
+            store_cls = CosStore
         else:
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageSpecError(
@@ -1386,3 +1402,246 @@ class GcsStore(AbstractStore):
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageBucketDeleteError(
                     f'Failed to delete GCS bucket {bucket_name}.')
+
+class CosStore(AbstractStore):
+    """CosStore inherits from Storage Object and represents the backend
+    for COS buckets.
+    """
+    # keep imports isolated to class
+    ibm_botocore = __import__('ibm_botocore')
+    ibm_boto3 = __import__('ibm_boto3')
+    REGIONS = ['us-south', 'us-east', 'eu-de', 'eu-gb',
+    'ca-tor', 'au-syd', 'br-sao', 'jp-osa', 'jp-tok']
+    ACCESS_DENIED_MESSAGE = 'Access Denied'
+
+    def __init__(self,
+                 name: str,
+                 source: str,
+                 region: Optional[str] = 'us-east',
+                 is_sky_managed: Optional[bool] = None):
+        self.client:'storage.Client'
+        self.bucket: 'StorageHandle'
+        super().__init__(name, source, region, is_sky_managed)
+
+    def _validate(self):
+        if self.source is not None and isinstance(self.source, str):
+            if self.source.startswith('s3://'):
+                assert self.name == data_utils.split_s3_path(self.source)[0], (
+                    'S3 Bucket is specified as path, the name should be the'
+                    ' same as S3 bucket.')
+            elif self.source.startswith('gs://'):
+                assert self.name == data_utils.split_gcs_path(self.source)[0], (
+                    'GCS Bucket is specified as path, the name should be '
+                    'the same as GCS bucket.')
+                assert data_utils.verify_gcs_bucket(self.name), (
+                    f'Source specified as {self.source}, a GCS bucket. ',
+                    'GCS Bucket should exist.')
+
+    def initialize(self):
+        """Initializes the S3 store object on the cloud.
+
+        Initialization involves fetching bucket if exists, or creating it if
+        it does not.
+
+        Raises:
+          StorageBucketCreateError: If bucket creation fails
+          StorageBucketGetError: If fetching existing bucket fails
+          StorageInitError: If general initialization fails.
+        """
+        self.client= data_utils.get_cos_client(self.region)
+        self.instance_id = data_utils.get_cos_instance()
+        self.s3_resource = data_utils.get_cos_resource(self.region)
+        self.bucket, is_new_bucket = self._get_bucket()
+        if self.is_sky_managed is None:
+            # If is_sky_managed is not specified, then this is a new storage
+            # object (i.e., did not exist in global_user_state) and we should
+            # set the is_sky_managed property.
+            # If is_sky_managed is specified, then we take no action.
+            self.is_sky_managed = is_new_bucket
+
+    def does_bucket_exist(self, bucket_name, region=None)->bool:
+        """
+        returns the region of the bucket if exists,
+         otherwise returns None.
+        :param bucket_name: name of the bucket
+        :param region: if specified looks for the bucket in that region only,
+            otherwise, bucket is searched across all available regions. 
+        """
+        for region in self.REGIONS if not region else [region]:
+            try:
+                # only way to change searched region
+                # is to reinitialize a client with a new region
+                tmp_client = data_utils.get_cos_client(region)
+                tmp_client.head_bucket(Bucket=bucket_name)
+                logger.debug(f'bucket was found in {region}')
+                return region
+            except self.ibm_botocore.exceptions.ClientError as e:
+                if e.response['Error']['Code'] == '404':
+                    logger.debug(f'bucket was not found in {region}')
+                else:
+                    raise e
+        return None
+
+    def upload(self):
+        """Uploads source to store bucket.
+
+        Upload must be called by the Storage handler - it is not called on
+        Store initialization.
+
+        Raises:
+            StorageUploadError: if upload fails.
+        """
+        try:
+            if isinstance(self.source, list):
+                self.batch_ibm_rsync(self.source, create_dirs=True)
+            elif self.source is not None:
+                if self.source.startswith('s3://'):
+                    raise Exception('IBM COS currently not supporting'
+                    'data transfers between COS and S3')
+                elif self.source.startswith('gs://'):
+                    raise Exception('IBM COS currently not supporting'
+                    'data transfers between COS and GS')
+                else:
+                    self.batch_ibm_rsync([self.source])
+        except exceptions.StorageUploadError:
+            raise
+        except Exception as e:
+            raise exceptions.StorageUploadError(
+                f'Upload failed for store {self.name}') from e
+
+    def delete(self) -> None:
+        self._delete_s3_bucket(self.name)
+        logger.info(f'{colorama.Fore.GREEN}Deleted S3 bucket {self.name}.'
+                    f'{colorama.Style.RESET_ALL}')
+
+    def get_handle(self) -> StorageHandle:
+        return self.s3_resource.Bucket(self.name)
+
+    def batch_ibm_rsync(self,
+                        source_path_list: List[Path],
+                        create_dirs: bool = False) -> None:
+        """Invokes eclone sync to batch upload a list of local paths to S3
+
+        Since rclone sync does not support batch operations, we construct
+        multiple commands to be run in parallel.
+
+        Args:
+            source_path_list: List of paths to local files or directories
+            create_dirs: If the local_path is a directory and this is set to
+                False, the contents of the directory are directly uploaded to
+                root of the bucket. If the local_path is a directory and this is
+                set to True, the directory is created in the bucket root and
+                contents are uploaded to it.
+        """
+
+        def get_sync_command(src_dir_path, dest_dir_name):
+            # we exclude .git directory from the sync
+            sync_command = (
+                'rclone sync --exclude ".git/*" '
+                f'{src_dir_path} '
+                f'remote:{self.name}/{dest_dir_name}')
+            return sync_command
+
+        # Generate message for upload
+        if len(source_path_list) > 1:
+            source_message = f'{len(source_path_list)} paths'
+        else:
+            source_message = source_path_list[0]
+
+        with backend_utils.safe_console_status(
+                f'[bold cyan]Syncing '
+                f'[green]{source_message}[/] to [green]cos://{self.region}/{self.name}/[/]'):
+            data_utils.parallel_upload_rclone(
+                source_path_list,
+                get_sync_command,
+                self.name,
+                self.ACCESS_DENIED_MESSAGE,
+                create_dirs=create_dirs,
+                max_concurrent_uploads=_MAX_CONCURRENT_UPLOADS)
+
+
+    def _transfer_to_s3(self) -> None: # IBM-TODO
+        assert isinstance(self.source, str), self.source
+        # if self.source.startswith('s3://'):
+        #     data_transfer.ibm_to_s3(self.name, self.name)
+
+    def _get_bucket(self) -> Tuple[StorageHandle, bool]:
+        """
+        returns:
+        StorageHandle(str) - bucket name
+        bool - indicates whether a new bucket was created.  
+        """
+        bucket_region = self.does_bucket_exist(self.name)
+        if not bucket_region: # bucket doesn't exist
+            return self._create_s3_bucket(self.name, self.region), True
+        # bucket exists, register its region
+        self.region=bucket_region
+        data_utils.store_rclone_config(self.region)
+        return self.s3_resource.Bucket(self.name), False
+
+    def _download_file(self, remote_path: str, local_path: str) -> None:
+        """Downloads file from remote to local on s3 bucket
+        using the boto3 API
+
+        Args:
+          remote_path: str; Remote path on S3 bucket
+          local_path: str; Local path on user's device
+        """
+        self.client.download_file(self.name, local_path, remote_path)
+
+    def mount_command(self, mount_path: str) -> str:
+        """Returns the command to mount the bucket to the mount_path.
+
+        Uses rclone to mount the bucket.
+        Source: https://github.com/rclone/rclone
+
+        Args:
+          mount_path: str; Path to mount the bucket to.
+        """
+        install_cmd = 'curl https://rclone.org/install.sh | sudo bash'
+        mount_cmd = f'rclone mount remote:{self.bucket.name} {mount_path} --daemon'
+        return mounting_utils.get_mounting_command(mount_path, install_cmd,
+                                                   mount_cmd)
+    def _create_s3_bucket(self,
+                          bucket_name: str,
+                          region='us-east') -> StorageHandle:
+        """Creates S3 bucket with specific name in specific region
+
+        Args:
+          bucket_name: str; Name of bucket
+          region: str; Region name, e.g. us-east, us-south
+        Raises:
+          StorageBucketCreateError: If bucket creation fails.
+        """
+        try:
+            self.client.create_bucket(Bucket=bucket_name, CreateBucketConfiguration={
+                'LocationConstraint':f'{region}-smart'}, IBMServiceInstanceId = self.instance_id)
+            logger.info(f'bucket {bucket_name} was created successfully')
+            self.region = region
+            self.bucket = self.s3_resource.Bucket(bucket_name)
+        
+        except self.ibm_botocore.exceptions.ClientError as e:
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.StorageBucketCreateError(
+                    f'Attempted to create a bucket '
+                    f'{bucket_name} but failed.') from e
+
+        s3_bucket_exists_waiter = self.client.get_waiter('bucket_exists')
+        s3_bucket_exists_waiter.wait(Bucket=bucket_name)
+
+        return self.bucket
+
+    def _delete_s3_bucket(self):
+        bucket = self.s3_resource.Bucket(self.name)
+        try:
+            bucket_versioning =  self.s3_resource.BucketVersioning(self.name)
+            if bucket_versioning.status == 'Enabled':
+                res = list(bucket.object_versions.delete())
+            else:
+                res = list(bucket.objects.delete())
+            logger.debug(f'Deleted content:\n{res}')
+            bucket.delete()
+            bucket.wait_until_not_exists()
+        except self.ibm_botocore.exceptions.ClientError as e:
+            if e.__class__.__name__ == "NoSuchBucket":
+                logger.debug("bucket already removed")

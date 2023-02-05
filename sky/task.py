@@ -414,6 +414,8 @@ class Task:
             return clouds.AWS()
         elif self.inputs.startswith('gs:'):
             return clouds.GCP()
+        elif self.inputs.startswith('cos:'):
+            return clouds.IBM()
         else:
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(f'cloud path not supported: {self.inputs}')
@@ -729,6 +731,14 @@ class Task:
                         blob_path = storage.source
                     else:
                         blob_path = 'gs://' + storage.name
+                    self.update_file_mounts({
+                        mnt_path: blob_path,
+                    })
+                elif store_type is storage_lib.StoreType.IBM:
+                    # in contrast to other providers the url prefix
+                    # includes region, i.e. cos://region/, hence 
+                    # can't add prefix if wasn't specified. 
+                    blob_path = storage.source
                     self.update_file_mounts({
                         mnt_path: blob_path,
                     })

@@ -145,6 +145,72 @@ class GcsCloudStorage(CloudStorage):
         all_commands.append(download_via_gsutil)
         return ' && '.join(all_commands)
 
+class CosCloudStorage(CloudStorage):
+    """IBM Cloud Storage."""
+    _REGIONS = ['us-south', 'us-east', 'eu-de', 'eu-gb',
+    'ca-tor', 'au-syd', 'br-sao', 'jp-osa', 'jp-tok']
+    # install rclone if package isn't already installed
+    _GET_RCLONE = [
+        'rclone --version >/dev/null 2>&1 || curl https://rclone.org/install.sh | sudo bash',
+    ]
+
+    def _parse_bucket_from_url(self, url: str):
+        """returns extracted bucket path from "cos://region/..." url"""
+        if not url.startswith('cos://'):
+            # received bucket name with possible path to bucket object
+            return url
+        parsed_url_values = url.split('//')[1].split('/',1)
+        region = parsed_url_values[0]
+        if region not in self._REGIONS:
+            raise ValueError('region missing from IBM COS url.')
+        return region, parsed_url_values[1] # returns bucket path
+
+    def is_directory(self, url: str) -> bool:
+        """Returns whether cos 'url' is a directory.
+
+        In cloud object stores, a "directory" refers to a regular object whose
+        name is a prefix of other objects.
+        """
+
+        region = url.split('//')[1].split('/')[0]
+        s3 = data_utils.get_cos_resource(region)
+        bucket_name, path = data_utils.split_cos_path(url, region)
+        bucket = s3.Bucket(bucket_name)
+
+        num_objects = 0
+        for obj in bucket.objects.filter(Prefix=path):
+            print(obj)
+
+            num_objects += 1
+            if obj.key == path:
+                return False
+            # If there are more than 1 object in filter, then it is a directory
+            if num_objects == 3:
+                return True
+
+        # A directory with few or no items
+        return True
+
+    def get_cmd(self, source: str, destination: str, is_folder: bool):
+        bucket_region, bucket_path = self._parse_bucket_from_url(source)
+        rclone_config_data = data_utils.store_rclone_config(bucket_region)
+        # store_rclone_config creates rclone config file at the cluster's nodes.
+        store_rclone_config = (f'echo "{rclone_config_data}">> ~/.config/rclone/rclone.conf')
+        mode = 'sync' if is_folder else 'copy'
+        download_via_rclone = (f'rclone {mode} remote:{bucket_path} {destination}')
+
+        all_commands = list(self._GET_RCLONE)
+        all_commands.append(store_rclone_config)
+        all_commands.append(download_via_rclone)
+        return ' && '.join(all_commands)
+
+    def make_sync_dir_command(self, source: str, destination: str) -> str:
+        """Syncs a folder using rclone."""
+        return self.get_cmd(source, destination, True)
+
+    def make_sync_file_command(self, source: str, destination: str) -> str:
+        """Copies a file using rclone."""
+        return self.get_cmd(source, destination, False)
 
 def get_storage_from_path(url: str) -> CloudStorage:
     """Returns a CloudStorage by identifying the scheme:// in a URL."""
@@ -159,4 +225,5 @@ def get_storage_from_path(url: str) -> CloudStorage:
 _REGISTRY = {
     'gs': GcsCloudStorage(),
     's3': S3CloudStorage(),
+    'cos': CosCloudStorage()
 }
